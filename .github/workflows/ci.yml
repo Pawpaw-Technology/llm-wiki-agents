@@ -13,10 +13,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/checkout@v4
-        with:
-          repository: 64andrewwalker/codebridge
-          path: ../tool/codebridge
+      - name: Clone codebridge dependency
+        run: git clone --depth 1 https://github.com/64andrewwalker/codebridge.git ../tool/codebridge
 
       - uses: actions/setup-node@v4
         with:
