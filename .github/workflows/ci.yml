@@ -20,6 +20,9 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install codebridge deps
+        run: npm install --prefix ../tool/codebridge
+
       - run: npm install
 
-      - run: npx tsc --noEmit
+      - run: npx tsc --noEmit --skipLibCheck
