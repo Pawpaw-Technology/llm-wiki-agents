@@ -11,30 +11,21 @@
  *   npm run classify -- --batch 10 --dry-run       # preview 10 pages
  */
 
-import { execSync } from "node:child_process";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { ClaudeCodeEngine } from "codebridge/src/engines/claude-code.js";
-import { KimiCodeEngine } from "codebridge/src/engines/kimi-code.js";
-import { CodexEngine } from "codebridge/src/engines/codex.js";
-import { OpenCodeEngine } from "codebridge/src/engines/opencode.js";
-import type { Engine } from "codebridge/src/core/engine.js";
+import {
+  WIKI_ROOT,
+  lw,
+  createEngine,
+  parseBaseArgs,
+  parseJsonResponse,
+  loadPrompt,
+  dispatchTask,
+} from "./shared.js";
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PROMPT_TEMPLATE = readFileSync(
-  path.join(__dirname, "../prompts/classify.md"),
-  "utf-8",
-);
-
-const WIKI_ROOT =
-  process.env.LW_WIKI_ROOT ||
-  process.env.WIKI_ROOT ||
-  path.resolve(__dirname, "../../wiki");
 
 const CATEGORIES = [
   "architecture",
@@ -46,56 +37,8 @@ const CATEGORIES = [
 ];
 
 // ---------------------------------------------------------------------------
-// Args
+// Page I/O
 // ---------------------------------------------------------------------------
-
-interface Args {
-  engine: string;
-  model: string;
-  batch: number;
-  dryRun: boolean;
-}
-
-function parseArgs(): Args {
-  const args = process.argv.slice(2);
-  const opts: Args = {
-    engine: "claude-code",
-    model: "",
-    batch: 20,
-    dryRun: false,
-  };
-  for (let i = 0; i < args.length; i++) {
-    switch (args[i]) {
-      case "--engine":
-      case "-e":
-        opts.engine = args[++i];
-        break;
-      case "--model":
-      case "-m":
-        opts.model = args[++i];
-        break;
-      case "--batch":
-      case "-b":
-        opts.batch = parseInt(args[++i], 10);
-        break;
-      case "--dry-run":
-        opts.dryRun = true;
-        break;
-    }
-  }
-  return opts;
-}
-
-// ---------------------------------------------------------------------------
-// LW CLI helpers
-// ---------------------------------------------------------------------------
-
-function lw(cmd: string): string {
-  return execSync(`lw ${cmd} --root "${WIKI_ROOT}"`, {
-    encoding: "utf-8",
-    timeout: 30_000,
-  }).trim();
-}
 
 interface PageEntry {
   path: string;
@@ -124,27 +67,6 @@ function writePage(pagePath: string, content: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Engine factory
-// ---------------------------------------------------------------------------
-
-function createEngine(name: string): Engine {
-  switch (name) {
-    case "claude-code":
-      return new ClaudeCodeEngine();
-    case "kimi-code":
-      return new KimiCodeEngine();
-    case "codex":
-      return new CodexEngine();
-    case "opencode":
-      return new OpenCodeEngine();
-    default:
-      throw new Error(
-        `Unknown engine: ${name}. Supported: claude-code, kimi-code, codex, opencode`,
-      );
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Classification
 // ---------------------------------------------------------------------------
 
@@ -167,43 +89,16 @@ function buildPrompt(
     null,
     2,
   );
-  return PROMPT_TEMPLATE.replace(
-    "{{categories}}",
-    CATEGORIES.join(", "),
-  ).replace("{{pages}}", pagesJson);
-}
-
-function parseResponse(output: string): Classification[] {
-  // Try direct JSON parse
-  try {
-    return JSON.parse(output);
-  } catch {}
-
-  // Try markdown code block
-  const codeBlockMatch = output.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
-  if (codeBlockMatch) {
-    try {
-      return JSON.parse(codeBlockMatch[1]);
-    } catch {}
-  }
-
-  // Try bracket search
-  const start = output.indexOf("[");
-  const end = output.lastIndexOf("]");
-  if (start !== -1 && end > start) {
-    try {
-      return JSON.parse(output.slice(start, end + 1));
-    } catch {}
-  }
-
-  throw new Error("Could not parse LLM response as JSON array");
+  return loadPrompt("classify", {
+    categories: CATEGORIES.join(", "),
+    pages: pagesJson,
+  });
 }
 
 function updatePageFrontmatter(
   content: string,
   classification: Classification,
 ): string {
-  // Replace frontmatter fields
   let updated = content;
 
   // Update tags
@@ -214,7 +109,6 @@ function updatePageFrontmatter(
     } else if (updated.match(/^tags:\s*$/m)) {
       updated = updated.replace(/^tags:\s*$/m, `tags: ${tagStr}`);
     } else {
-      // Insert after title line
       updated = updated.replace(/^(title:.*\n)/m, `$1tags: ${tagStr}\n`);
     }
   }
@@ -242,7 +136,7 @@ function updatePageFrontmatter(
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const args = parseArgs();
+  const args = parseBaseArgs({ batch: 20 });
   const engine = createEngine(args.engine);
 
   console.error(`Wiki:   ${WIKI_ROOT}`);
@@ -296,17 +190,12 @@ async function main() {
     `\n🤖 Calling ${args.engine}${args.model ? ` (${args.model})` : ""}...`,
   );
   const startTime = Date.now();
-  const response = await engine.start({
-    task_id: `classify-${Date.now()}`,
-    intent: "ops",
-    workspace_path: WIKI_ROOT,
-    message: prompt,
-    engine: args.engine as any,
+  const response = await dispatchTask(engine, {
+    taskId: `classify-${Date.now()}`,
+    prompt,
+    wikiRoot: WIKI_ROOT,
+    engineName: args.engine,
     model: args.model || undefined,
-    mode: "new",
-    session_id: null,
-    constraints: { timeout_ms: 300_000, allow_network: true },
-    images: [],
   });
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   console.error(`   Done in ${elapsed}s`);
@@ -321,7 +210,7 @@ async function main() {
   // 4. Parse classifications
   let classifications: Classification[];
   try {
-    classifications = parseResponse(response.output);
+    classifications = parseJsonResponse<Classification[]>(response.output);
   } catch (e) {
     console.error(`\n❌ Parse error: ${(e as Error).message}`);
     console.error(
@@ -348,7 +237,6 @@ async function main() {
     const filename = path.basename(oldPath);
     const newPath = `${cls.category}/${filename}`;
 
-    // Read, update frontmatter, write to new location
     try {
       const content = readPage(oldPath);
       const updated = updatePageFrontmatter(content, cls);
