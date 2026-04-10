@@ -533,9 +533,9 @@ async function main() {
       } catch (e) {
         const msg = `Parse error: ${(e as Error).message}`;
         console.error(`   \u274c ${msg}`);
-        console.error(
-          `   Raw output (first 500 chars): ${response.output.slice(0, 500)}`,
-        );
+        console.error(`   Output length: ${response.output.length} chars`);
+        console.error(`   First 300: ${response.output.slice(0, 300)}`);
+        console.error(`   Last 200: ${response.output.slice(-200)}`);
         details.push({ source: sourcePath, status: "failed", error: msg });
         failed++;
         continue;

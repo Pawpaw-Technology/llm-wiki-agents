@@ -111,36 +111,88 @@ export function createEngine(name: string): Engine {
 // JSON response parsing
 // ---------------------------------------------------------------------------
 
+/**
+ * Fix raw newlines inside JSON string values.
+ * LLMs often output {"key":"line1\nline2"} with actual newline chars,
+ * which is illegal JSON (must be \\n). This repairs them.
+ */
+function fixRawNewlinesInJson(text: string): string {
+  // Replace raw newlines that appear inside JSON string values.
+  // Strategy: walk through the string tracking quote state.
+  let result = "";
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) {
+      result += ch;
+      escape = false;
+      continue;
+    }
+    if (ch === "\\" && inString) {
+      result += ch;
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      result += ch;
+      continue;
+    }
+    if (inString && ch === "\n") {
+      result += "\\n";
+      continue;
+    }
+    if (inString && ch === "\r") {
+      result += "\\r";
+      continue;
+    }
+    if (inString && ch === "\t") {
+      result += "\\t";
+      continue;
+    }
+    result += ch;
+  }
+  return result;
+}
+
+function tryParse<T>(text: string): T | undefined {
+  try {
+    return JSON.parse(text) as T;
+  } catch {}
+  // Retry with newline fix
+  try {
+    return JSON.parse(fixRawNewlinesInJson(text)) as T;
+  } catch {}
+  return undefined;
+}
+
 export function parseJsonResponse<T>(output: string): T {
   // Tier 1: direct parse
-  try {
-    return JSON.parse(output) as T;
-  } catch {}
+  const t1 = tryParse<T>(output);
+  if (t1 !== undefined) return t1;
 
   // Tier 2: markdown code block
   const codeBlockMatch = output.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
   if (codeBlockMatch) {
-    try {
-      return JSON.parse(codeBlockMatch[1]) as T;
-    } catch {}
+    const t2 = tryParse<T>(codeBlockMatch[1]);
+    if (t2 !== undefined) return t2;
   }
 
   // Tier 3a: array bracket search
   const arrStart = output.indexOf("[");
   const arrEnd = output.lastIndexOf("]");
   if (arrStart !== -1 && arrEnd > arrStart) {
-    try {
-      return JSON.parse(output.slice(arrStart, arrEnd + 1)) as T;
-    } catch {}
+    const t3a = tryParse<T>(output.slice(arrStart, arrEnd + 1));
+    if (t3a !== undefined) return t3a;
   }
 
   // Tier 3b: object bracket search
   const objStart = output.indexOf("{");
   const objEnd = output.lastIndexOf("}");
   if (objStart !== -1 && objEnd > objStart) {
-    try {
-      return JSON.parse(output.slice(objStart, objEnd + 1)) as T;
-    } catch {}
+    const t3b = tryParse<T>(output.slice(objStart, objEnd + 1));
+    if (t3b !== undefined) return t3b;
   }
 
   throw new Error("Could not parse LLM response as JSON");
