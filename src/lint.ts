@@ -73,18 +73,23 @@ function parseLintArgs(): LintArgs {
 // Types
 // ---------------------------------------------------------------------------
 
+interface LintFinding {
+  path: string;
+  detail: string;
+}
+
 interface FreshnessReport {
   fresh: number;
   suspect: number;
   stale: number;
-  stale_pages: string[];
+  stale_pages: LintFinding[];
 }
 
 interface LintReport {
-  todo_pages: string[];
-  broken_related: { page: string; broken_link: string }[];
-  orphan_pages: string[];
-  missing_concepts: { slug: string; references: string[] }[];
+  todo_pages: LintFinding[];
+  broken_related: LintFinding[];
+  orphan_pages: LintFinding[];
+  missing_concepts: LintFinding[];
   freshness: FreshnessReport;
 }
 
@@ -143,6 +148,43 @@ function runLint(category: string): LintReport {
   const categoryArg = category ? ` --category ${category}` : "";
   const raw = lw(`lint --format json${categoryArg}`);
   return JSON.parse(raw) as LintReport;
+}
+
+// ---------------------------------------------------------------------------
+// Wikilink scanner — find pages that reference [[slug]]
+// ---------------------------------------------------------------------------
+
+function findReferencingPages(slug: string): string[] {
+  const results: string[] = [];
+  const categories = [
+    "architecture",
+    "training",
+    "infra",
+    "tools",
+    "product",
+    "ops",
+    "concepts",
+  ];
+
+  for (const cat of categories) {
+    const catDir = path.join(WIKI_DIR, cat);
+    if (!existsSync(catDir)) continue;
+    let files: string[];
+    try {
+      files = readdirSync(catDir).filter((f) => f.endsWith(".md"));
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      const content = readFileSync(path.join(catDir, file), "utf-8");
+      // Match [[slug]] or [[slug|display text]]
+      if (content.includes(`[[${slug}]]`) || content.includes(`[[${slug}|`)) {
+        results.push(`${cat}/${file}`);
+      }
+    }
+  }
+
+  return results;
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +248,18 @@ function computeSimilarity(a: string, b: string): number {
 function fixBrokenRelated(findings: LintReport["broken_related"]): number {
   let fixed = 0;
 
-  for (const { page, broken_link } of findings) {
+  for (const finding of findings) {
+    const page = finding.path;
+    // Extract broken link target from detail: "related entry not found: ops/bar.md"
+    const linkMatch = finding.detail.match(/related entry not found: (.+)/);
+    if (!linkMatch) {
+      console.error(
+        `   skipped ${page} — could not parse detail: ${finding.detail}`,
+      );
+      continue;
+    }
+    const broken_link = linkMatch[1];
+
     const absPath = path.join(WIKI_DIR, page);
     if (!existsSync(absPath)) {
       console.error(`   skipped ${page} — file not found`);
@@ -217,11 +270,9 @@ function fixBrokenRelated(findings: LintReport["broken_related"]): number {
     const match = findClosestMatch(broken_link);
 
     if (match) {
-      // Replace the broken link with the closest match
       content = content.replaceAll(broken_link, match);
       console.error(`   fixed ${page}: ${broken_link} -> ${match}`);
     } else {
-      // Remove the broken related entry from frontmatter
       const lines = content.split("\n");
       const filtered = lines.filter((line) => !line.includes(broken_link));
       content = filtered.join("\n");
@@ -239,7 +290,7 @@ function fixBrokenRelated(findings: LintReport["broken_related"]): number {
 // Auto-fix: orphan_pages
 // ---------------------------------------------------------------------------
 
-function fixOrphanPages(orphans: string[]): number {
+function fixOrphanPages(orphans: LintFinding[]): number {
   if (orphans.length === 0) return 0;
 
   const indexPath = path.join(WIKI_DIR, "index.md");
@@ -257,7 +308,8 @@ function fixOrphanPages(orphans: string[]): number {
     concepts: "## Concepts",
   };
 
-  for (const orphan of orphans) {
+  for (const finding of orphans) {
+    const orphan = finding.path;
     // Extract category from path (e.g., "ops/foo.md" -> "ops")
     const category = orphan.split("/")[0];
     const heading = categoryHeadings[category];
@@ -318,16 +370,18 @@ async function proposeMissingConcepts(
   const conventions = readConventions();
   const engine = createEngine(args.engine);
 
-  // Only process concepts with 3+ references (spec requirement)
-  const eligible = concepts.filter((c) => c.references.length >= 3);
+  for (const finding of concepts) {
+    // Extract slug from path: "concepts/foo.md" -> "foo"
+    const slug = path.basename(finding.path, ".md");
 
-  for (const concept of eligible) {
-    console.error(
-      `   generating concept: ${concept.slug} (${concept.references.length} refs)`,
-    );
+    // Scan wiki for pages that reference [[slug]] to find the actual referencing pages
+    const references = findReferencingPages(slug);
+    if (references.length < 3) continue; // Safety check
+
+    console.error(`   generating concept: ${slug} (${references.length} refs)`);
 
     // Read referencing pages, truncated to 300 chars each
-    const referencingPages = concept.references
+    const referencingPages = references
       .map((ref) => {
         try {
           const content = readWikiFile(ref);
@@ -341,9 +395,8 @@ async function proposeMissingConcepts(
     const prompt = loadPrompt("lint-fix", {
       mode: "concept",
       conventions,
-      concept_slug: concept.slug,
+      concept_slug: slug,
       referencing_pages: referencingPages,
-      // Mode B placeholders — empty when in concept mode
       current_page: "",
       raw_source: "",
     });
@@ -357,7 +410,7 @@ async function proposeMissingConcepts(
 
     try {
       const response = await dispatchTask(engine, {
-        taskId: `lint-concept-${concept.slug}-${Date.now()}`,
+        taskId: `lint-concept-${slug}-${Date.now()}`,
         prompt,
         wikiRoot: WIKI_ROOT,
         engineName: args.engine,
@@ -365,9 +418,7 @@ async function proposeMissingConcepts(
       });
 
       if (response.error) {
-        console.error(
-          `   error for ${concept.slug}: ${response.error.message}`,
-        );
+        console.error(`   error for ${slug}: ${response.error.message}`);
         continue;
       }
 
@@ -380,15 +431,15 @@ async function proposeMissingConcepts(
 
       proposals.push({
         type: "create_concept",
-        slug: parsed.slug || concept.slug,
+        slug: parsed.slug || slug,
         content: parsed.wiki_page_markdown,
         index_entry: parsed.index_entry,
         related_updates: parsed.related_updates || [],
       });
 
-      console.error(`   proposal ready: ${concept.slug}`);
+      console.error(`   proposal ready: ${slug}`);
     } catch (e) {
-      console.error(`   failed for ${concept.slug}: ${(e as Error).message}`);
+      console.error(`   failed for ${slug}: ${(e as Error).message}`);
     }
   }
 
@@ -400,14 +451,15 @@ async function proposeMissingConcepts(
 // ---------------------------------------------------------------------------
 
 async function proposeTodoRewrites(
-  todoPages: string[],
+  todoPages: LintFinding[],
   args: LintArgs,
 ): Promise<RewriteProposal[]> {
   const proposals: RewriteProposal[] = [];
   const conventions = readConventions();
   const engine = createEngine(args.engine);
 
-  for (const pagePath of todoPages) {
+  for (const finding of todoPages) {
+    const pagePath = finding.path;
     console.error(`   generating rewrite: ${pagePath}`);
 
     let currentPage: string;
@@ -761,7 +813,7 @@ async function main() {
   if (report.freshness.stale_pages.length > 0) {
     proposals.push({
       type: "stale_warning",
-      paths: report.freshness.stale_pages,
+      paths: report.freshness.stale_pages.map((f) => f.path),
     });
   }
 
@@ -793,7 +845,7 @@ async function main() {
           }
           return p;
         }),
-      stale_warnings: report.freshness.stale_pages,
+      stale_warnings: report.freshness.stale_pages.map((f) => f.path),
     };
     console.log(JSON.stringify(output, null, 2));
     return;
@@ -835,7 +887,7 @@ async function main() {
       concept_pages: applied.concept_pages,
       rewrites: applied.rewrites,
     },
-    stale_warnings: report.freshness.stale_pages,
+    stale_warnings: report.freshness.stale_pages.map((f) => f.path),
     lint_after: lintAfter,
   };
   console.log(JSON.stringify(output, null, 2));
