@@ -254,32 +254,45 @@ function expandSource(source: string): string[] {
 // Validation
 // ---------------------------------------------------------------------------
 
-function validateResponse(
-  resp: IngestResponse,
-  sourcePath: string,
-): string | null {
-  // slug <= 60 chars
+/**
+ * Forgiving validation: fix what we can, only reject if truly broken.
+ * Returns null if the response is usable (possibly after auto-fixes).
+ * Returns an error string only if wiki_page_markdown is unparseable.
+ */
+function validateAndFixResponse(resp: IngestResponse): string | null {
+  // Hard reject: no wiki_page_markdown or doesn't contain frontmatter
+  if (
+    !resp.wiki_page_markdown ||
+    !resp.wiki_page_markdown.trimStart().startsWith("---")
+  ) {
+    return "wiki_page_markdown is missing or has no frontmatter (---)";
+  }
+
+  // Auto-fix: slug too long → truncate
   if (resp.slug.length > 60) {
-    return `slug "${resp.slug}" exceeds 60 characters (${resp.slug.length})`;
+    const original = resp.slug;
+    resp.slug = resp.slug.slice(0, 60).replace(/-$/, "");
+    console.error(`   ⚠️  slug truncated: ${original} → ${resp.slug}`);
   }
 
-  // valid category
+  // Auto-fix: invalid category → _uncategorized
   if (!CATEGORIES.includes(resp.category)) {
-    return `invalid category "${resp.category}" (must be one of: ${CATEGORIES.join(", ")})`;
+    console.error(
+      `   ⚠️  invalid category "${resp.category}" → _uncategorized`,
+    );
+    resp.category = "_uncategorized";
   }
 
-  // wiki_page_markdown starts with ---
-  if (!resp.wiki_page_markdown.trimStart().startsWith("---")) {
-    return "wiki_page_markdown does not start with frontmatter (---)";
-  }
-
-  // related_updates paths must exist
+  // Auto-fix: filter out related_updates pointing to non-existent files
   if (resp.related_updates && resp.related_updates.length > 0) {
-    for (const update of resp.related_updates) {
-      if (!wikiFileExists(update.path)) {
-        return `related_updates path "${update.path}" does not exist`;
+    const valid = resp.related_updates.filter((u) => {
+      if (!wikiFileExists(u.path)) {
+        console.error(`   ⚠️  skipping related update: ${u.path} not found`);
+        return false;
       }
-    }
+      return true;
+    });
+    resp.related_updates = valid;
   }
 
   return null;
@@ -526,25 +539,58 @@ async function main() {
         continue;
       }
 
-      // Parse JSON response
+      // Parse JSON response (with same-session retry on failure)
       let result: IngestResponse;
-      try {
-        result = parseJsonResponse<IngestResponse>(response.output);
-      } catch (e) {
-        const msg = `Parse error: ${(e as Error).message}`;
-        console.error(`   \u274c ${msg}`);
-        console.error(`   Output length: ${response.output.length} chars`);
-        console.error(`   First 300: ${response.output.slice(0, 300)}`);
-        console.error(`   Last 200: ${response.output.slice(-200)}`);
-        details.push({ source: sourcePath, status: "failed", error: msg });
-        failed++;
-        continue;
-      }
+      let parseOutput = response.output;
+      let sessionId = response.sessionId;
 
-      // Validate response
-      const validationError = validateResponse(result, sourcePath);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          result = parseJsonResponse<IngestResponse>(parseOutput);
+          break;
+        } catch (e) {
+          if (attempt === 0 && sessionId) {
+            // Same-session correction: send error back to LLM
+            console.error(
+              `   ⚠️  Parse failed, requesting correction in same session...`,
+            );
+            try {
+              const correction = await engine.send(
+                sessionId,
+                [
+                  "Your previous output could not be parsed as valid JSON.",
+                  `Error: ${(e as Error).message}`,
+                  "Please re-output the SAME content as a single valid JSON object.",
+                  "Make sure all newlines in string values are escaped as \\n.",
+                  "No preamble, no code fences — just the raw JSON object.",
+                ].join(" "),
+                { timeoutMs: 120_000, cwd: WIKI_ROOT },
+              );
+
+              if (!correction.error && correction.output) {
+                parseOutput = correction.output;
+                console.error(
+                  `   🔄 Got correction (${correction.output.length} chars)`,
+                );
+                continue;
+              }
+            } catch {
+              // Correction failed, fall through to error
+            }
+          }
+          const msg = `Parse error: ${(e as Error).message}`;
+          console.error(`   ❌ ${msg}`);
+          console.error(`   Output length: ${parseOutput.length} chars`);
+          details.push({ source: sourcePath, status: "failed", error: msg });
+          failed++;
+        }
+      }
+      if (!result!) continue;
+
+      // Validate response (forgiving — auto-fixes what it can)
+      const validationError = validateAndFixResponse(result);
       if (validationError) {
-        console.error(`   \u274c Validation failed: ${validationError}`);
+        console.error(`   ❌ Validation failed: ${validationError}`);
         details.push({
           source: sourcePath,
           status: "failed",

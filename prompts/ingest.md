@@ -94,4 +94,15 @@ Respond with ONLY a JSON object, no other text:
 }
 ```
 
+## Self-Validation Checklist
+
+Before outputting, verify:
+
+1. Your slug is ≤ 60 characters
+2. Your category is one of: architecture, training, infra, tools, product, ops (NOT concepts)
+3. Your wiki_page_markdown starts with `---` and has valid YAML frontmatter
+4. All newlines in your JSON string values are escaped as `\n`, not raw newlines
+5. Your index_entry follows the format `- [Title](category/slug.md) — summary`
+6. All `related_updates[].path` entries point to pages listed in the wiki index above
+
 Respond with ONLY the JSON object. No preamble, no explanation, no markdown fence around the outer JSON.
