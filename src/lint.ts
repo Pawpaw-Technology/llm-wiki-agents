@@ -269,14 +269,28 @@ function fixBrokenRelated(findings: LintReport["broken_related"]): number {
     let content = readFileSync(absPath, "utf-8");
     const match = findClosestMatch(broken_link);
 
-    if (match) {
-      content = content.replaceAll(broken_link, match);
-      console.error(`   fixed ${page}: ${broken_link} -> ${match}`);
+    if (match && match !== page) {
+      // Check if match already exists in related: to avoid duplicates
+      if (content.includes(match)) {
+        // Already referenced — just remove the broken entry
+        const lines = content.split("\n");
+        const filtered = lines.filter((line) => !line.includes(broken_link));
+        content = filtered.join("\n");
+        console.error(
+          `   removed ${page}: ${broken_link} (match ${match} already present)`,
+        );
+      } else {
+        content = content.replaceAll(broken_link, match);
+        console.error(`   fixed ${page}: ${broken_link} -> ${match}`);
+      }
     } else {
+      // No match or match is self — remove the entry
       const lines = content.split("\n");
       const filtered = lines.filter((line) => !line.includes(broken_link));
       content = filtered.join("\n");
-      console.error(`   removed ${page}: ${broken_link} (no match found)`);
+      console.error(
+        `   removed ${page}: ${broken_link} (${match === page ? "self-reference" : "no match found"})`,
+      );
     }
 
     writeFileSync(absPath, content, "utf-8");
