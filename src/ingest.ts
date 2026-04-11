@@ -12,30 +12,25 @@
  *   npm run ingest -- --batch 5 --dry-run             # preview 5 sources
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { execSync } from "node:child_process";
 import path from "node:path";
 import {
   WIKI_ROOT,
+  CATEGORIES,
   createEngine,
   parseBaseArgs,
   parseJsonResponse,
   loadPrompt,
   dispatchTask,
+  readWikiFile,
+  writeWikiFile,
+  wikiFileExists,
+  readConventions,
+  readIndex,
+  appendToLog,
+  appendToIndex,
 } from "./shared.js";
-
-// ---------------------------------------------------------------------------
-// Categories (same as classify.ts — concepts excluded per spec)
-// ---------------------------------------------------------------------------
-
-const CATEGORIES = [
-  "architecture",
-  "training",
-  "infra",
-  "tools",
-  "product",
-  "ops",
-];
 
 // ---------------------------------------------------------------------------
 // CLI argument parsing (extends BaseArgs with --source)
@@ -92,36 +87,12 @@ interface IngestDetail {
 }
 
 // ---------------------------------------------------------------------------
-// Wiki file helpers
+// Raw file reader (not in shared — only ingest reads raw/)
 // ---------------------------------------------------------------------------
-
-function readWikiFile(relPath: string): string {
-  const absPath = path.join(WIKI_ROOT, "wiki", relPath);
-  return readFileSync(absPath, "utf-8");
-}
-
-function writeWikiFile(relPath: string, content: string): void {
-  const absPath = path.join(WIKI_ROOT, "wiki", relPath);
-  mkdirSync(path.dirname(absPath), { recursive: true });
-  writeFileSync(absPath, content, "utf-8");
-}
-
-function wikiFileExists(relPath: string): boolean {
-  return existsSync(path.join(WIKI_ROOT, "wiki", relPath));
-}
 
 function readRawFile(relPath: string): string {
   const absPath = path.join(WIKI_ROOT, relPath);
   return readFileSync(absPath, "utf-8");
-}
-
-function readConventions(): string {
-  const claudeMdPath = path.join(WIKI_ROOT, "CLAUDE.md");
-  return readFileSync(claudeMdPath, "utf-8");
-}
-
-function readIndex(): string {
-  return readWikiFile("index.md");
 }
 
 // ---------------------------------------------------------------------------
@@ -358,32 +329,7 @@ function applyRelatedUpdates(updates: IngestResponse["related_updates"]): void {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Append to index.md and log.md
-// ---------------------------------------------------------------------------
-
-function appendToIndex(indexEntry: string): void {
-  const indexPath = path.join(WIKI_ROOT, "wiki", "index.md");
-  const content = readFileSync(indexPath, "utf-8");
-  writeFileSync(
-    indexPath,
-    content.trimEnd() + "\n" + indexEntry + "\n",
-    "utf-8",
-  );
-}
-
-function appendToLog(logEntry: string): void {
-  const logPath = path.join(WIKI_ROOT, "wiki", "log.md");
-  const date = new Date().toISOString().slice(0, 10);
-  const entry = `[${date}] ${logEntry}`;
-
-  if (existsSync(logPath)) {
-    const content = readFileSync(logPath, "utf-8");
-    writeFileSync(logPath, content.trimEnd() + "\n" + entry + "\n", "utf-8");
-  } else {
-    writeFileSync(logPath, `# Wiki Log\n\n${entry}\n`, "utf-8");
-  }
-}
+// appendToIndex and appendToLog are now imported from shared.ts
 
 // ---------------------------------------------------------------------------
 // Main
@@ -540,52 +486,49 @@ async function main() {
       }
 
       // Parse JSON response (with same-session retry on failure)
-      let result: IngestResponse;
+      let result: IngestResponse | undefined;
       let parseOutput = response.output;
       let sessionId = response.sessionId;
 
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          result = parseJsonResponse<IngestResponse>(parseOutput);
-          break;
-        } catch (e) {
-          if (attempt === 0 && sessionId) {
-            // Same-session correction: send error back to LLM
-            console.error(
-              `   ⚠️  Parse failed, requesting correction in same session...`,
+      // Try parsing, with one same-session retry on failure
+      try {
+        result = parseJsonResponse<IngestResponse>(parseOutput);
+      } catch (firstError) {
+        if (sessionId) {
+          console.error(
+            `   ⚠️  Parse failed, requesting correction in same session...`,
+          );
+          try {
+            const correction = await engine.send(
+              sessionId,
+              [
+                "Your previous output could not be parsed as valid JSON.",
+                `Error: ${(firstError as Error).message}`,
+                "Please re-output the SAME content as a single valid JSON object.",
+                "Make sure all newlines in string values are escaped as \\n.",
+                "No preamble, no code fences — just the raw JSON object.",
+              ].join(" "),
+              { timeoutMs: 120_000, cwd: WIKI_ROOT },
             );
-            try {
-              const correction = await engine.send(
-                sessionId,
-                [
-                  "Your previous output could not be parsed as valid JSON.",
-                  `Error: ${(e as Error).message}`,
-                  "Please re-output the SAME content as a single valid JSON object.",
-                  "Make sure all newlines in string values are escaped as \\n.",
-                  "No preamble, no code fences — just the raw JSON object.",
-                ].join(" "),
-                { timeoutMs: 120_000, cwd: WIKI_ROOT },
+            if (!correction.error && correction.output) {
+              console.error(
+                `   🔄 Got correction (${correction.output.length} chars)`,
               );
-
-              if (!correction.error && correction.output) {
-                parseOutput = correction.output;
-                console.error(
-                  `   🔄 Got correction (${correction.output.length} chars)`,
-                );
-                continue;
-              }
-            } catch {
-              // Correction failed, fall through to error
+              result = parseJsonResponse<IngestResponse>(correction.output);
             }
+          } catch {
+            // Correction also failed
           }
-          const msg = `Parse error: ${(e as Error).message}`;
+        }
+        if (!result) {
+          const msg = `Parse error: ${(firstError as Error).message}`;
           console.error(`   ❌ ${msg}`);
           console.error(`   Output length: ${parseOutput.length} chars`);
           details.push({ source: sourcePath, status: "failed", error: msg });
           failed++;
+          continue;
         }
       }
-      if (!result!) continue;
 
       // Validate response (forgiving — auto-fixes what it can)
       const validationError = validateAndFixResponse(result);
@@ -650,7 +593,7 @@ async function main() {
       // Append to index.md
       console.error(`   \ud83d\udcc7 Updating index.md`);
       try {
-        appendToIndex(result.index_entry);
+        appendToIndex(result.index_entry, result.category);
       } catch (e) {
         console.error(
           `\n\u274c FATAL: Index write failed: ${(e as Error).message}`,

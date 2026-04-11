@@ -12,7 +12,13 @@
  */
 
 import { execSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import {
+  readFileSync,
+  writeFileSync,
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+} from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ClaudeCodeEngine } from "codebridge/src/engines/claude-code.js";
@@ -241,4 +247,100 @@ export async function dispatchTask(
     },
     images: [],
   });
+}
+
+// ---------------------------------------------------------------------------
+// Wiki categories
+// ---------------------------------------------------------------------------
+
+export const CATEGORIES = [
+  "architecture",
+  "training",
+  "infra",
+  "tools",
+  "product",
+  "ops",
+];
+
+// ---------------------------------------------------------------------------
+// Wiki file I/O
+// ---------------------------------------------------------------------------
+
+const WIKI_DIR = path.join(WIKI_ROOT, "wiki");
+
+export function readWikiFile(relPath: string): string {
+  return readFileSync(path.join(WIKI_DIR, relPath), "utf-8");
+}
+
+export function writeWikiFile(relPath: string, content: string): void {
+  const absPath = path.join(WIKI_DIR, relPath);
+  mkdirSync(path.dirname(absPath), { recursive: true });
+  writeFileSync(absPath, content, "utf-8");
+}
+
+export function wikiFileExists(relPath: string): boolean {
+  return existsSync(path.join(WIKI_DIR, relPath));
+}
+
+export function readConventions(): string {
+  return readFileSync(path.join(WIKI_ROOT, "CLAUDE.md"), "utf-8");
+}
+
+export function readIndex(): string {
+  return readFileSync(path.join(WIKI_DIR, "index.md"), "utf-8");
+}
+
+export function appendToLog(message: string): void {
+  const logPath = path.join(WIKI_DIR, "log.md");
+  const date = new Date().toISOString().slice(0, 10);
+  const entry = `\n## [${date}] ${message}\n`;
+  if (!existsSync(logPath)) {
+    writeFileSync(logPath, `# Wiki Log\n${entry}`, "utf-8");
+  } else {
+    const content = readFileSync(logPath, "utf-8");
+    const insertPos = content.indexOf("\n## ");
+    if (insertPos !== -1) {
+      writeFileSync(
+        logPath,
+        content.slice(0, insertPos) + entry + content.slice(insertPos),
+        "utf-8",
+      );
+    } else {
+      appendFileSync(logPath, entry, "utf-8");
+    }
+  }
+}
+
+export function appendToIndex(entry: string, category: string): void {
+  const indexPath = path.join(WIKI_DIR, "index.md");
+  let content = readFileSync(indexPath, "utf-8");
+
+  const headingMap: Record<string, string> = {
+    ops: "## Ops",
+    architecture: "## Architecture",
+    training: "## Training",
+    infra: "## Infra",
+    tools: "## Tools",
+    product: "## Product",
+    concepts: "## Concepts",
+  };
+
+  const heading = headingMap[category];
+  if (!heading) {
+    content = content.trimEnd() + "\n" + entry + "\n";
+  } else {
+    const headingIdx = content.indexOf(heading);
+    if (headingIdx === -1) {
+      content += `\n\n${heading}\n\n${entry}\n`;
+    } else {
+      const afterHeading = content.indexOf("\n", headingIdx);
+      const nextHeading = content.indexOf("\n## ", afterHeading + 1);
+      const insertPos = nextHeading === -1 ? content.length : nextHeading;
+      const before = content.slice(0, insertPos).trimEnd();
+      const after = content.slice(insertPos);
+      content = before + "\n" + entry + "\n" + after;
+    }
+  }
+
+  writeFileSync(indexPath, content, "utf-8");
 }

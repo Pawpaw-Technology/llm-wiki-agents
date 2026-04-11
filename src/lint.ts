@@ -22,14 +22,21 @@ import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 import {
   WIKI_ROOT,
+  CATEGORIES,
   lw,
   createEngine,
   parseBaseArgs,
   parseJsonResponse,
   loadPrompt,
   dispatchTask,
+  readWikiFile,
+  writeWikiFile,
+  wikiFileExists,
+  readConventions,
+  appendToLog,
+  appendToIndex,
 } from "./shared.js";
-import type { BaseArgs } from "./shared.js";
+import type { BaseArgs, Engine } from "./shared.js";
 
 // ---------------------------------------------------------------------------
 // CLI args (extends BaseArgs)
@@ -115,30 +122,9 @@ interface StaleWarning {
 
 type Proposal = ConceptProposal | RewriteProposal | StaleWarning;
 
-// ---------------------------------------------------------------------------
-// Wiki I/O helpers
-// ---------------------------------------------------------------------------
+// Wiki I/O helpers imported from shared.ts
 
 const WIKI_DIR = path.join(WIKI_ROOT, "wiki");
-
-function readWikiFile(relPath: string): string {
-  const absPath = path.join(WIKI_DIR, relPath);
-  return readFileSync(absPath, "utf-8");
-}
-
-function writeWikiFile(relPath: string, content: string): void {
-  const absPath = path.join(WIKI_DIR, relPath);
-  writeFileSync(absPath, content, "utf-8");
-}
-
-function wikiFileExists(relPath: string): boolean {
-  return existsSync(path.join(WIKI_DIR, relPath));
-}
-
-function readConventions(): string {
-  const claudeMdPath = path.join(WIKI_ROOT, "CLAUDE.md");
-  return readFileSync(claudeMdPath, "utf-8");
-}
 
 // ---------------------------------------------------------------------------
 // lw lint wrapper
@@ -156,17 +142,8 @@ function runLint(category: string): LintReport {
 
 function findReferencingPages(slug: string): string[] {
   const results: string[] = [];
-  const categories = [
-    "architecture",
-    "training",
-    "infra",
-    "tools",
-    "product",
-    "ops",
-    "concepts",
-  ];
 
-  for (const cat of categories) {
+  for (const cat of [...CATEGORIES, "concepts"]) {
     const catDir = path.join(WIKI_DIR, cat);
     if (!existsSync(catDir)) continue;
     let files: string[];
@@ -379,10 +356,10 @@ function fixOrphanPages(orphans: LintFinding[]): number {
 async function proposeMissingConcepts(
   concepts: LintReport["missing_concepts"],
   args: LintArgs,
+  conventions: string,
+  engine: Engine,
 ): Promise<ConceptProposal[]> {
   const proposals: ConceptProposal[] = [];
-  const conventions = readConventions();
-  const engine = createEngine(args.engine);
 
   for (const finding of concepts) {
     // Extract slug from path: "concepts/foo.md" -> "foo"
@@ -467,10 +444,10 @@ async function proposeMissingConcepts(
 async function proposeTodoRewrites(
   todoPages: LintFinding[],
   args: LintArgs,
+  conventions: string,
+  engine: Engine,
 ): Promise<RewriteProposal[]> {
   const proposals: RewriteProposal[] = [];
-  const conventions = readConventions();
-  const engine = createEngine(args.engine);
 
   for (const finding of todoPages) {
     const pagePath = finding.path;
@@ -658,41 +635,7 @@ function applyProposals(proposals: Proposal[]): {
   return { concept_pages: conceptPages, rewrites };
 }
 
-// ---------------------------------------------------------------------------
-// Index and log helpers
-// ---------------------------------------------------------------------------
-
-function appendToIndex(entry: string, category: string): void {
-  const indexPath = path.join(WIKI_DIR, "index.md");
-  let content = readFileSync(indexPath, "utf-8");
-
-  const categoryHeadings: Record<string, string> = {
-    ops: "## Ops",
-    architecture: "## Architecture",
-    training: "## Training",
-    infra: "## Infra",
-    tools: "## Tools",
-    product: "## Product",
-    concepts: "## Concepts",
-  };
-
-  const heading = categoryHeadings[category];
-  if (!heading) return;
-
-  const headingIdx = content.indexOf(heading);
-  if (headingIdx === -1) {
-    content += `\n\n${heading}\n\n${entry}\n`;
-  } else {
-    const afterHeading = content.indexOf("\n", headingIdx);
-    const nextHeading = content.indexOf("\n## ", afterHeading + 1);
-    const insertPos = nextHeading === -1 ? content.length : nextHeading;
-    const before = content.slice(0, insertPos).trimEnd();
-    const after = content.slice(insertPos);
-    content = before + "\n" + entry + "\n" + after;
-  }
-
-  writeFileSync(indexPath, content, "utf-8");
-}
+// appendToIndex, appendToLog imported from shared.ts
 
 function updateIndexEntry(
   pagePath: string,
@@ -702,7 +645,6 @@ function updateIndexEntry(
   const indexPath = path.join(WIKI_DIR, "index.md");
   let content = readFileSync(indexPath, "utf-8");
 
-  // Try to find existing entry for this page and replace it
   const escaped = pagePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const entryPattern = new RegExp(`^- \\[.*\\]\\(${escaped}\\).*$`, "m");
   const match = content.match(entryPattern);
@@ -711,20 +653,8 @@ function updateIndexEntry(
     content = content.replace(entryPattern, newEntry);
     writeFileSync(indexPath, content, "utf-8");
   } else {
-    // Entry doesn't exist yet — append under the correct category
     appendToIndex(newEntry, category);
   }
-}
-
-function appendToLog(message: string): void {
-  const logPath = path.join(WIKI_DIR, "log.md");
-  if (!existsSync(logPath)) return;
-
-  const date = new Date().toISOString().slice(0, 10);
-  const entry = `[${date}] ${message}`;
-  let content = readFileSync(logPath, "utf-8");
-  content = content.trimEnd() + "\n" + entry + "\n";
-  writeFileSync(logPath, content, "utf-8");
 }
 
 // ---------------------------------------------------------------------------
@@ -800,6 +730,12 @@ async function main() {
   // ---------------------------------------------------------------------------
   const proposals: Proposal[] = [];
 
+  // Create engine + load conventions once for all LLM proposals
+  const needsLlm =
+    report.missing_concepts.length > 0 || report.todo_pages.length > 0;
+  const conventions = needsLlm ? readConventions() : "";
+  const engine = needsLlm ? createEngine(args.engine) : null;
+
   // Missing concepts
   if (report.missing_concepts.length > 0) {
     console.error(
@@ -808,6 +744,8 @@ async function main() {
     const conceptProposals = await proposeMissingConcepts(
       report.missing_concepts,
       args,
+      conventions,
+      engine!,
     );
     proposals.push(...conceptProposals);
     console.error("");
@@ -818,7 +756,12 @@ async function main() {
     console.error(
       `🤖 Generating rewrite proposals (${report.todo_pages.length} TODO pages)...`,
     );
-    const rewriteProposals = await proposeTodoRewrites(report.todo_pages, args);
+    const rewriteProposals = await proposeTodoRewrites(
+      report.todo_pages,
+      args,
+      conventions,
+      engine!,
+    );
     proposals.push(...rewriteProposals);
     console.error("");
   }
