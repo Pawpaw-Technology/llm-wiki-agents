@@ -46,21 +46,21 @@ interface IngestArgs {
   model: string;
   batch: number;
   dryRun: boolean;
-  source: string | null;
+  sources: string[];
 }
 
 function parseIngestArgs(): IngestArgs {
   const base = parseBaseArgs({ batch: 10 });
-  let source: string | null = null;
+  const sources: string[] = [];
 
   const args = process.argv.slice(2);
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--source" || args[i] === "-s") {
-      source = args[++i];
+      sources.push(args[++i]);
     }
   }
 
-  return { ...base, source };
+  return { ...base, sources };
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +198,7 @@ function scanRawSources(batch: number): string[] {
   let allRaw: string[];
   try {
     allRaw = execSync(
-      `find "${rawDir}" -type f \\( -name "*.md" -o -name "*.json" \\)`,
+      `find "${rawDir}" -maxdepth 2 -type f \\( -name "*.md" -o -name "*.json" \\)`,
       { encoding: "utf-8", timeout: 10_000 },
     )
       .trim()
@@ -411,10 +411,10 @@ async function main() {
   console.error("\n\ud83d\udd0d Building source list...");
   let sources: string[];
 
-  if (args.source) {
-    sources = expandSource(args.source);
+  if (args.sources.length > 0) {
+    sources = args.sources.flatMap((s) => expandSource(s));
     if (sources.length === 0) {
-      console.error(`   \u274c No files matched --source "${args.source}"`);
+      console.error(`   \u274c No files matched --source arguments`);
       console.log(
         JSON.stringify({ created: 0, skipped: 0, failed: 0, details: [] }),
       );
