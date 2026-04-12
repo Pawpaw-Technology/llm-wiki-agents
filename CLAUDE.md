@@ -15,15 +15,22 @@ LLM Wiki Agents (`@llm-wiki/agents`) — TypeScript orchestration layer that cla
 
 Agents call the `lw` CLI for wiki operations and use `codebridge` for multi-engine LLM dispatch. No API keys in this layer — LLM access is via codebridge subprocess engines (claude-code, kimi-code, codex, opencode).
 
+Three active agents share `src/shared.ts` for wiki I/O, engine creation, prompt loading, JSON parsing, and index/log updates. Each agent owns its own CLI arg extension and validation logic.
+
 ## Structure
 
 ```
 src/
+├── shared.ts      # Common utilities — BaseArgs, wiki I/O, engine factory,
+│                  #   parseJsonResponse, loadPrompt, dispatchTask,
+│                  #   appendToIndex, appendToLog, CATEGORIES
 ├── classify.ts    # Classification agent — sorts _uncategorized pages
-├── librarian.ts   # Q&A librarian agent (planned)
-└── lint.ts        # Freshness triage agent (planned)
+├── ingest.ts      # Batch ingest agent — raw/ sources → wiki pages
+└── lint.ts        # Lint agent — report/fix/apply modes (auto-fix + LLM proposals)
 prompts/
-└── classify.md    # Prompt template for classification
+├── classify.md    # Prompt template for classification
+├── ingest.md      # Prompt template for raw-source ingestion
+└── lint-fix.md    # Prompt template for lint fixes (concept + rewrite modes)
 ```
 
 ## Dependencies
@@ -36,9 +43,16 @@ prompts/
 
 ```bash
 npm install                                    # install deps (needs monorepo layout for codebridge)
-npm run classify                               # classify with claude-code
-npm run classify -- --engine kimi-code         # use kimi
+npm run classify                               # classify _uncategorized pages
+npm run classify -- --engine kimi-code         # use kimi engine
 npm run classify -- --batch 10 --dry-run       # preview 10 pages
+npm run ingest                                 # auto-scan raw/, ingest unprocessed sources
+npm run ingest -- --source "raw/tweets/foo.md" # ingest explicit source file
+npm run ingest -- --batch 5 --dry-run          # preview 5 sources
+npm run lint                                   # report only (no changes)
+npm run lint -- --fix                          # auto-fix + generate LLM proposals
+npm run lint -- --fix --apply                  # auto-fix + apply LLM proposals, then re-lint
+npm run lint -- --fix --category ops           # scope fixes to one category
 ```
 
 ## Environment
@@ -59,7 +73,12 @@ npm run classify -- --dry-run
 ## Project Conventions
 
 - TypeScript strict mode, ESNext modules
-- CLI args: `--engine`, `--model`, `--batch`, `--dry-run`
-- Errors and progress to stderr, structured output to stdout
-- Prompt templates in `prompts/` with `{{placeholder}}` syntax
-- Agent-friendly: `--dry-run` for preview, JSON stdout for piping
+- All agents import wiki I/O and engine helpers from `src/shared.ts` — never duplicate
+- CLI args parsed via `parseBaseArgs()`: `--engine`, `--model`, `--batch`, `--dry-run`
+- Agent-specific args extend `BaseArgs` (e.g. ingest adds `--source`, lint adds `--fix`/`--apply`/`--category`)
+- Errors and progress to stderr, structured JSON output to stdout
+- Prompt templates in `prompts/` with `{{placeholder}}` syntax, loaded via `loadPrompt()`
+- LLM responses parsed with `parseJsonResponse<T>()` (handles code blocks, raw newlines, bracket extraction)
+- `--dry-run` previews prompt + target list without LLM calls
+- Engine created once in `main()`, passed to functions that need LLM dispatch
+- Same-session retry via `engine.send()` on JSON parse failure (ingest agent)
