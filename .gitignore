@@ -1,1 +1,3 @@
 node_modules/
+.claude/staleness-warnings.jsonl
+.claude/settings.local.json
